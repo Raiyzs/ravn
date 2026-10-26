@@ -1,0 +1,52 @@
+name: GPU report
+description: ravn worked, or didn't, on your card. Both help.
+title: "[gfx____] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. The traps differ by GPU generation, so the report below is what makes it fixable.
+        `ravn doctor --share` already includes your GPU's gfx name, distro, kernel and ravn version.
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - It works
+        - Install failed
+        - Verify failed
+        - App crashed or hung (launch or generation)
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: ravn doctor --share
+      description: Paste the whole output.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: ravn install comfyui
+  - type: textarea
+    id: verify
+    attributes:
+      label: ravn verify comfyui (or ollama)
+      description: Skip this if it won't run.
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Launch log
+      description: |
+        The full terminal output of the command that failed: install, run, or the generation that crashed.
+        For Ollama started with `ravn enable ollama`: `journalctl --user -u ravn-ollama -n 100`.
+      render: text
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else

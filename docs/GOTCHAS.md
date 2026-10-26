@@ -173,4 +173,4 @@ right file.
 
 ---
 
-Found another one? Open an issue with the output of `ravn doctor --share`.
+Found another one? [File a GPU report](https://github.com/Raiyzs/ravn/issues/new?template=gpu-report.yml) with the output of `ravn doctor --share`.

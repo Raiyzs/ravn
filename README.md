@@ -101,8 +101,8 @@ things, and any installed apps. Real output from an RX 9070 XT:
 | Polaris, RDNA1 | RX 580, 5700 XT | CPU / experimental | Vulkan |
 
 "Tested" means on my own hardware. Everything else follows from the kernels compiled into
-PyTorch 2.14.1 for ROCm 7.2; if your card behaves differently, please open an issue with
-`ravn doctor --share`.
+PyTorch 2.14.1 for ROCm 7.2; if your card behaves differently, please
+[file a GPU report](https://github.com/Raiyzs/ravn/issues/new?template=gpu-report.yml).
 
 ## What it changes on your system
 
