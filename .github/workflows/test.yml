@@ -1,0 +1,9 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning -e SC2155 ravn install.sh tests/run.sh
+      - run: bash tests/run.sh

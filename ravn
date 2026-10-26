@@ -1,0 +1,972 @@
+#!/usr/bin/env bash
+# ravn — wake the AMD GPU for local AI on Bazzite and other atomic Linux.
+# User space only: no sudo, no distrobox, no CUDA wheels.
+# https://github.com/Raiyzs/ravn · MIT license
+set -Eeuo pipefail
+
+RAVN_VERSION="0.1.0"
+RAVN_REPO="Raiyzs/ravn"
+RAVN_HOME="${RAVN_HOME:-$HOME/ravn}"
+RAVN_BIN="${RAVN_BIN:-$HOME/.local/bin}"
+RAVN_SYSFS="${RAVN_SYSFS:-/sys}"                 # tests point this at a fixture tree
+RAVN_AMDGPU_IDS="${RAVN_AMDGPU_IDS:-/usr/share/libdrm/amdgpu.ids}"
+RAVN_PYTHON="${RAVN_PYTHON:-3.12}"
+RAVN_TORCH="${RAVN_TORCH:-2.14.1}"
+RAVN_ROCM="${RAVN_ROCM:-7.2}"
+RAVN_SUPPORT_URL="${RAVN_SUPPORT_URL:-https://buy.stripe.com/bJe6oG4IKgfIdvhgbBcfK03}"
+TORCH_INDEX="https://download.pytorch.org/whl/rocm${RAVN_ROCM}"
+
+# gfx targets compiled into the PyTorch ROCm 7.2 wheels (read from torch 2.14.1+rocm7.2).
+# Used to predict support before torch is installed; installed venvs report their own list.
+TORCH_ARCHS="gfx900 gfx906 gfx908 gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1200 gfx1201"
+# gfx targets Ollama's ROCm build ships kernels for (read from v0.40.11's libggml-hip.so).
+# Once Ollama is installed, ravn reads the real list from the library instead.
+OLLAMA_ARCHS="gfx908 gfx90a gfx942 gfx950 gfx1030 gfx1100 gfx1101 gfx1102 gfx1150 gfx1151 gfx1200 gfx1201"
+
+APPS="comfyui ollama"
+
+# ── output ──────────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_T=$'\e[38;5;51m' C_V=$'\e[38;5;141m' C_R=$'\e[38;5;204m' C_D=$'\e[38;5;245m' C_B=$'\e[1m' C_0=$'\e[0m'
+else
+  C_T="" C_V="" C_R="" C_D="" C_B="" C_0=""
+fi
+ok()   { printf '  %s✓%s %s\n' "$C_T" "$C_0" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_V" "$C_0" "$*"; WARNINGS=$((WARNINGS+1)); }
+bad()  { printf '  %s✗%s %s\n' "$C_R" "$C_0" "$*"; PROBLEMS=$((PROBLEMS+1)); }
+note() { printf '  %s·%s %s\n' "$C_D" "$C_0" "$*"; }
+more() { printf '      %s%s%s\n' "$C_D" "$*" "$C_0"; }
+head2() { printf '\n %s%s%s\n' "$C_B" "$*" "$C_0"; }
+step() { printf '%s▸%s %s\n' "$C_T" "$C_0" "$*"; }
+die()  { printf '%sravn:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+WARNINGS=0 PROBLEMS=0
+
+trap 'die "failed at line $LINENO: $BASH_COMMAND"' ERR
+
+human() { # bytes -> "16 GB" / "2.3 TB" / "512 MB" (binary units, rounded the way cards are sold)
+  awk -v b="${1:-0}" 'BEGIN{ g=b/1073741824
+    if (g>=1024) printf "%.1f TB", g/1024; else if (g>=4) printf "%.0f GB", g;
+    else if (g>=1) printf "%.1f GB", g; else printf "%d MB", b/1048576 }'
+}
+tilde() { local p=$1; printf '%s' "${p/#$HOME/\~}"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+confirm() { # confirm "question" default(y|n)
+  [[ ${RAVN_YES:-0} == 1 ]] && return 0
+  [[ -t 0 ]] || { [[ $2 == y ]]; return; }
+  local a hint="[y/N]"; [[ $2 == y ]] && hint="[Y/n]"
+  read -r -p "  $1 $hint " a || true
+  a=${a:-$2}; [[ $a == [yY]* ]]
+}
+
+# ── GPU detection (KFD topology: the same view ROCm has) ────────────────
+prop() { awk -v k="$2" '$1==k{print $2; exit}' "$1" 2>/dev/null || true; }
+
+gfx_name() { # gfx_target_version (e.g. 120001) -> gfx1201, 90010 -> gfx90a
+  local v=$1
+  printf 'gfx%d%x%x' $((v / 10000)) $(((v / 100) % 100)) $((v % 100))
+}
+
+gfx_to_hsa() { # gfx1030 -> 10.3.0, gfx90a -> 9.0.10, gfx1151 -> 11.5.1
+  local s=${1#gfx}
+  printf '%s.%d.%d' "${s:0:${#s}-2}" $((16#${s: -2:1})) $((16#${s: -1}))
+}
+
+family_candidates() { # nearest ISA-compatible targets to borrow kernels from
+  case $1 in
+    gfx103?) echo gfx1030 ;;
+    gfx101?) echo gfx1030 ;;          # RDNA1: partial at best
+    gfx110?) echo gfx1100 ;;
+    gfx115?) echo gfx1151 gfx1150 gfx1100 ;;
+    gfx120?) echo gfx1201 gfx1200 ;;
+    gfx90c|gfx902|gfx909) echo gfx900 ;;
+  esac
+}
+
+# target <gfx> "<arch list>" -> "native" | "override <hsa> <gfx>" | "none"
+target() {
+  local g=$1 archs=" $2 " c
+  if [[ $archs == *" $g "* ]]; then echo native; return; fi
+  for c in $(family_candidates "$g"); do
+    if [[ $archs == *" $c "* ]]; then echo "override $(gfx_to_hsa "$c") $c"; return; fi
+  done
+  echo none
+}
+
+experimental() { [[ $1 == gfx101? || $1 == gfx90c || $1 == gfx902 || $1 == gfx909 ]]; }
+
+gpu_name() { # marketing name from libdrm's table, then lspci, then the PCI id
+  local dev=$1 id rev name=""
+  id=$(cat "$dev/device" 2>/dev/null || echo 0x0000); id=${id#0x}
+  rev=$(cat "$dev/revision" 2>/dev/null || echo 0x00); rev=${rev#0x}
+  if [[ -r $RAVN_AMDGPU_IDS ]]; then
+    name=$(awk -F',[ \t]*' -v d="${id^^}" -v r="${rev^^}" \
+      'toupper($1)==d && toupper($2)==r {print $3; exit}' "$RAVN_AMDGPU_IDS" || true)
+    [[ -n $name ]] || name=$(awk -F',[ \t]*' -v d="${id^^}" 'toupper($1)==d {print $3; exit}' "$RAVN_AMDGPU_IDS" || true)
+  fi
+  if [[ -z $name && $RAVN_SYSFS == /sys ]] && command -v lspci >/dev/null; then
+    name=$(lspci -d "1002:$id" 2>/dev/null | head -1 | sed -E 's/.*\[AMD\/ATI\] //; s/ \(rev .*//' || true)
+  fi
+  printf '%s' "${name:-AMD GPU 0x$id}"
+}
+
+GPU_GFX=() GPU_NAME=() GPU_VRAM=() GPU_RENDER=()
+detect_gpus() {
+  GPU_GFX=() GPU_NAME=() GPU_VRAM=() GPU_RENDER=()
+  local topo="$RAVN_SYSFS/class/kfd/kfd/topology/nodes" n p gtv minor dev
+  [[ -d $topo ]] || return 0
+  for n in $(ls "$topo" | sort -n); do
+    p="$topo/$n/properties"
+    [[ -r $p ]] || continue
+    gtv=$(prop "$p" gfx_target_version)
+    [[ ${gtv:-0} -gt 0 ]] || continue          # CPU nodes report 0
+    minor=$(prop "$p" drm_render_minor)
+    dev="$RAVN_SYSFS/class/drm/renderD$minor/device"
+    GPU_GFX+=("$(gfx_name "$gtv")")
+    GPU_VRAM+=("$(cat "$dev/mem_info_vram_total" 2>/dev/null || echo 0)")
+    GPU_RENDER+=("renderD$minor")
+    GPU_NAME+=("$(gpu_name "$dev")")
+  done
+}
+
+primary_gpu() { # index of the GPU with the most VRAM
+  local i best=0
+  for i in "${!GPU_VRAM[@]}"; do
+    (( GPU_VRAM[i] > GPU_VRAM[best] )) && best=$i
+  done
+  echo "$best"
+}
+
+# Environment every ravn app runs with. Prints KEY=VALUE lines.
+gpu_env() { # gpu_env <arch list>
+  local archs=$1 p t
+  detect_gpus
+  [[ ${#GPU_GFX[@]} -gt 0 ]] || return 0
+  p=$(primary_gpu)
+  # A Ryzen iGPU shows up as a second ROCm device. Without pinning, PyTorch can
+  # dispatch kernels to it and die with hipErrorInvalidDeviceFunction.
+  if [[ ${#GPU_GFX[@]} -gt 1 ]]; then
+    echo "HIP_VISIBLE_DEVICES=$p"
+    echo "CUDA_VISIBLE_DEVICES=$p"
+  fi
+  t=$(target "${GPU_GFX[p]}" "$archs")
+  if [[ $t == override* ]]; then
+    echo "HSA_OVERRIDE_GFX_VERSION=$(awk '{print $2}' <<<"$t")"
+  fi
+  case ${GPU_GFX[p]} in
+    gfx11*|gfx12*) echo "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1" ;;   # flash attention on RDNA3/4
+  esac
+  echo "MIOPEN_FIND_MODE=FAST"          # skip minutes of conv tuning on first run
+}
+
+bad_alloc_conf() { # expandable_segments crashes ROCm builds of PyTorch
+  local v
+  for v in PYTORCH_CUDA_ALLOC_CONF PYTORCH_HIP_ALLOC_CONF PYTORCH_ALLOC_CONF; do
+    [[ ${!v:-} == *expandable_segments* ]] && echo "$v"
+  done
+  return 0
+}
+
+# Run a command with the app's GPU environment applied.
+with_env() { # with_env <arch list> <cmd...>
+  local archs=$1; shift
+  local -a envs=() unsets=()
+  local line v
+  while IFS= read -r line; do [[ -n $line ]] && envs+=("$line"); done < <(gpu_env "$archs")
+  for v in $(bad_alloc_conf); do unsets+=(-u "$v"); done
+  [[ -n ${HSA_OVERRIDE_GFX_VERSION:-} ]] && unsets+=(-u HSA_OVERRIDE_GFX_VERSION)
+  if [[ -f $RAVN_HOME/ravn.env ]]; then  # user overrides win
+    while IFS= read -r line; do
+      [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && envs+=("$line")
+    done < "$RAVN_HOME/ravn.env"
+  fi
+  env "${unsets[@]}" "${envs[@]}" "$@"
+}
+
+# ── tooling ─────────────────────────────────────────────────────────────
+ensure_uv() {
+  command -v uv >/dev/null 2>&1 && return 0
+  if [[ -x $HOME/.local/bin/uv ]]; then PATH="$HOME/.local/bin:$PATH"; return 0; fi
+  step "Installing uv (Astral's Python manager) into ~/.local/bin"
+  curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >/dev/null \
+    || die "could not install uv — see https://docs.astral.sh/uv/"
+  PATH="$HOME/.local/bin:$PATH"
+}
+
+write_overrides() { # packages that must never land in an AMD venv
+  mkdir -p "$RAVN_HOME/.ravn"
+  cat > "$RAVN_HOME/.ravn/overrides.txt" <<'EOF'
+# ravn: dropped from every resolution.
+# plain triton overwrites triton-rocm / pytorch-triton-rocm (same import name) and breaks HIP kernels
+triton ; sys_platform == 'never'
+# CUDA-only onnxruntime; shadows the CPU build and drags in CUDA libraries
+onnxruntime-gpu ; sys_platform == 'never'
+EOF
+  echo "$RAVN_HOME/.ravn/overrides.txt"
+}
+
+site_packages() { compgen -G "$1/lib/python3*/site-packages" | head -1 || true; }
+
+# Filesystem-only health check of a venv (instant, safe to run before every launch).
+venv_problems() { # prints one problem tag per line
+  local sp; sp=$(site_packages "$1")
+  [[ -n $sp ]] || { echo no-venv; return 0; }
+  sp_problems "$sp"
+}
+
+sp_problems() { # same checks, given a site-packages directory
+  local sp=$1
+  local t; t=$(compgen -G "$sp/torch-*.dist-info" | head -1 || true)
+  if [[ -z $t ]]; then echo no-torch
+  elif [[ $t != *+rocm* ]]; then echo "torch-not-rocm:$(basename "$t" .dist-info)"; fi
+  compgen -G "$sp/triton-*.dist-info" >/dev/null && echo plain-triton
+  if compgen -G "$sp/*triton_rocm-*.dist-info" >/dev/null && [[ ! -f $sp/triton/__init__.py ]]; then
+    echo triton-missing        # ROCm triton registered, but its files were removed with plain triton
+  fi
+  compgen -G "$sp/nvidia_*.dist-info" >/dev/null && echo cuda-wheels
+  compgen -G "$sp/onnxruntime_gpu-*.dist-info" >/dev/null && echo onnxruntime-gpu
+  return 0
+}
+
+# The torch wheel is ~6 GB. uv restarts a dropped download from zero, and a broken IPv6
+# route makes that likely, so fetch it with curl (resumable) and check the index's sha256.
+fetch_torch_wheel() { # prints the local wheel path
+  local cp="cp${RAVN_PYTHON/./}" dir="$RAVN_HOME/.ravn/wheels" href url sha name
+  href=$(curl -fsSL --retry 5 "$TORCH_INDEX/torch/" \
+    | grep -o "href=\"[^\"]*torch-${RAVN_TORCH}%2Brocm${RAVN_ROCM}-${cp}-${cp}-manylinux[^\"]*x86_64\.whl[^\"]*\"" \
+    | head -1 | cut -d'"' -f2 || true)
+  [[ -n $href ]] || die "torch $RAVN_TORCH for ROCm $RAVN_ROCM / Python $RAVN_PYTHON is not on $TORCH_INDEX"
+  url=${href%%#*}; sha=${href##*sha256=}; [[ $url == /* ]] && url="https://download.pytorch.org$url"
+  name=$(basename "$url"); name=${name//%2B/+}
+  mkdir -p "$dir"
+  if [[ ! -f $dir/$name ]]; then
+    curl -fL --progress-bar --retry 20 --retry-all-errors --retry-delay 3 -C - -o "$dir/$name.part" "$url" >&2 \
+      || die "download failed — run the same command again, it resumes where it stopped"
+    if [[ $href == *sha256=* ]] && [[ $(sha256sum "$dir/$name.part" | cut -d' ' -f1) != "$sha" ]]; then
+      rm -f "$dir/$name.part"; die "torch wheel failed its sha256 check — deleted, run again"
+    fi
+    mv "$dir/$name.part" "$dir/$name"
+  fi
+  echo "$dir/$name"
+}
+
+install_torch() { # install_torch <venv>
+  local py="$1/bin/python" whl
+  step "PyTorch $RAVN_TORCH for ROCm $RAVN_ROCM (about 6 GB, resumable)"
+  whl=$(fetch_torch_wheel)
+  UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120} \
+    uv pip install --python "$py" --index-url "$TORCH_INDEX" "torch @ file://$whl" torchvision torchaudio
+  "$py" - > "$1/../ravn-constraints.txt" <<'EOF'
+from importlib.metadata import version, PackageNotFoundError
+print("# ravn: the ROCm build this app was verified with")
+for d in ("torch", "torchvision", "torchaudio", "triton-rocm", "pytorch-triton-rocm"):
+    try:
+        print(f"{d}=={version(d)}")
+    except PackageNotFoundError:
+        pass
+EOF
+}
+
+heal() { # heal <app dir>  — undo what a stray pip install did to the ROCm stack
+  local app=$1 py="$1/venv/bin/python" sp p probs i ver names=() pins=()
+  sp=$(site_packages "$app/venv"); probs=$(venv_problems "$app/venv")
+  [[ -f $app/ravn-constraints.txt ]] || die "no $app/ravn-constraints.txt — reinstall with: ravn remove + ravn install"
+  for p in "$sp"/triton-*.dist-info "$sp"/nvidia_*.dist-info "$sp"/onnxruntime_gpu-*.dist-info; do
+    [[ -e $p ]] || continue
+    p=$(basename "$p"); names+=("${p%%-[0-9]*}")
+  done
+  if [[ ${#names[@]} -gt 0 ]]; then
+    step "Removing ${#names[@]} package(s) that break ROCm: ${names[*]//_/-}"
+    uv pip uninstall --python "$py" "${names[@]//_/-}" >/dev/null 2>&1 || true
+  fi
+  # Restore only what broke. Plain triton shares the triton/ folder, so removing it took the
+  # ROCm triton's files too; a swapped torch needs the whole set back.
+  if [[ $probs == *torch-not-rocm* || $probs == *no-torch* ]]; then
+    mapfile -t pins < <(grep -E '^(torch|torchvision|torchaudio|triton-rocm|pytorch-triton-rocm)==' "$app/ravn-constraints.txt")
+  elif [[ $probs == *plain-triton* || $probs == *triton-missing* ]]; then
+    mapfile -t pins < <(grep -E '^(triton-rocm|pytorch-triton-rocm)==' "$app/ravn-constraints.txt")
+  fi
+  if [[ ${#pins[@]} -gt 0 ]]; then
+    step "Restoring ${pins[*]}"
+    for i in "${!pins[@]}"; do   # torch from ravn's local wheel, never a second 6 GB download
+      if [[ ${pins[i]} == torch==* ]]; then
+        ver=${pins[i]#torch==}
+        pins[i]="torch @ file://$(RAVN_TORCH=${ver%%+*} fetch_torch_wheel)"
+      fi
+    done
+    uv pip install -q --python "$py" --index-url "$TORCH_INDEX" --force-reinstall --no-deps "${pins[@]}"
+  fi
+  ok "healed"
+}
+
+heal_if_needed() {
+  local app=$1 probs
+  probs=$(venv_problems "$app/venv")
+  [[ -z $probs ]] && return 0
+  warn "the ROCm stack in $(tilde "$app/venv") was changed: $(tr '\n' ' ' <<<"$probs")"
+  more "usually a custom node or extension ran pip install torch/triton"
+  if [[ ${RAVN_NO_HEAL:-0} == 1 ]]; then more "RAVN_NO_HEAL=1 set — not touching it"; return 0; fi
+  ensure_uv; heal "$app"
+}
+
+app_dir() { echo "$RAVN_HOME/$1"; }
+
+self_install() { # menu entries and units call $RAVN_BIN/ravn — make sure it's there
+  local me; me=$(readlink -f "$0")
+  [[ $me == "$(readlink -f "$RAVN_BIN/ravn" 2>/dev/null)" ]] && return 0
+  mkdir -p "$RAVN_BIN"; install -m 755 "$me" "$RAVN_BIN/ravn"
+  note "ravn copied to $(tilde "$RAVN_BIN/ravn")"
+}
+is_installed() { [[ -f $(app_dir "$1")/ravn.app ]]; }
+valid_app() { [[ " $APPS " == *" $1 "* ]] || die "unknown app '$1' (apps: $APPS)"; }
+
+mark_installed() { # mark_installed <app> <version>
+  printf 'app=%s\nversion=%s\ninstalled=%s\nravn=%s\n' "$1" "$2" "$(date -Iseconds)" "$RAVN_VERSION" \
+    > "$(app_dir "$1")/ravn.app"
+}
+
+support_line() {
+  printf '\n  %sravn is free. If it saved you a weekend: %s%s\n' "$C_D" "$RAVN_SUPPORT_URL" "$C_0"
+}
+
+# ── doctor ──────────────────────────────────────────────────────────────
+cmd_doctor() {
+  local share=0; [[ ${1:-} == --share ]] && share=1
+  [[ $share == 1 ]] && { C_T="" C_V="" C_R="" C_D="" C_B="" C_0=""; }
+  printf '\n %sravn doctor%s %s\n' "$C_B" "$C_0" "$RAVN_VERSION"
+
+  head2 "System"
+  local os="Linux" variant="" atomic=""
+  if [[ -r /etc/os-release ]]; then
+    os=$(. /etc/os-release; echo "${NAME:-Linux} ${VERSION_ID:-}")
+    variant=$(. /etc/os-release; echo "${VARIANT_ID:-}")
+  fi
+  [[ -e /run/ostree-booted ]] && atomic="atomic"
+  ok "$os${variant:+ ($variant)}${atomic:+, $atomic} · kernel $(uname -r)"
+  if [[ -d $RAVN_SYSFS/module/amdgpu ]]; then ok "amdgpu kernel driver loaded"
+  else bad "amdgpu kernel driver not loaded — no AMD GPU, or the driver failed to start"; fi
+  if [[ $RAVN_SYSFS != /sys ]]; then note "fixture mode ($RAVN_SYSFS)"
+  elif [[ ! -e /dev/kfd ]]; then bad "/dev/kfd missing — ROCm compute is unavailable (Vulkan apps can still work)"
+  elif [[ -r /dev/kfd && -w /dev/kfd ]]; then ok "/dev/kfd is accessible"
+  else
+    bad "/dev/kfd exists but your user can't open it"
+    more "fix: sudo usermod -aG render,video \$USER, then log out and in"
+  fi
+
+  head2 "GPUs"
+  detect_gpus
+  local i p t g ollama_t
+  if [[ ${#GPU_GFX[@]} -eq 0 ]]; then
+    bad "no ROCm-visible AMD GPU found"
+  else
+    p=$(primary_gpu)
+    for i in "${!GPU_GFX[@]}"; do
+      g=${GPU_GFX[i]}
+      if [[ $i != "$p" ]]; then
+        note "[$i] ${GPU_NAME[i]} · $g · $(human "${GPU_VRAM[i]}") — hidden from AI apps"
+        continue
+      fi
+      t=$(target "$g" "$TORCH_ARCHS")
+      case $t in
+        native) ok "[$i] ${GPU_NAME[i]} · $g · $(human "${GPU_VRAM[i]}") · PyTorch ROCm: native" ;;
+        override*)
+          if experimental "$g"; then
+            warn "[$i] ${GPU_NAME[i]} · $g · $(human "${GPU_VRAM[i]}") · PyTorch ROCm: experimental"
+          else
+            ok "[$i] ${GPU_NAME[i]} · $g · $(human "${GPU_VRAM[i]}") · PyTorch ROCm: via override"
+          fi
+          more "runs ${t##* } kernels with HSA_OVERRIDE_GFX_VERSION=$(awk '{print $2}' <<<"$t") — ravn sets this per app"
+          ;;
+        none)
+          bad "[$i] ${GPU_NAME[i]} · $g · $(human "${GPU_VRAM[i]}") · no PyTorch ROCm kernels for this GPU"
+          more "image/video apps will fall back to CPU; LLMs still run on Vulkan (ravn's Ollama uses it)"
+          ;;
+      esac
+      ollama_t=$(target "$g" "$(ollama_archs)")
+      [[ $ollama_t == none ]] && more "Ollama: Vulkan backend (no ROCm build for $g)"
+    done
+    if [[ ${#GPU_GFX[@]} -gt 1 ]]; then
+      warn "${#GPU_GFX[@]} GPUs visible to ROCm — ravn pins its apps to [$p] (HIP_VISIBLE_DEVICES=$p)"
+      more "unpinned, PyTorch can send kernels to the iGPU: hipErrorInvalidDeviceFunction"
+    fi
+    if (( GPU_VRAM[p] > 0 && GPU_VRAM[p] < 7516192768 )); then
+      note "under 8 GB VRAM: use small/quantized models and ComfyUI's --lowvram"
+    fi
+  fi
+
+  head2 "Environment"
+  if command -v uv >/dev/null 2>&1 || [[ -x $HOME/.local/bin/uv ]]; then
+    ok "uv $( (command -v uv >/dev/null && uv --version || "$HOME/.local/bin/uv" --version) 2>/dev/null | awk '{print $2}')"
+  else
+    note "uv not installed — ravn installs it into ~/.local/bin on first app install"
+  fi
+  command -v git >/dev/null && ok "git $(git --version | awk '{print $3}')" || bad "git not found"
+  local v hazards=0
+  for v in $(bad_alloc_conf); do
+    warn "$v contains expandable_segments — crashes ROCm PyTorch; ravn strips it for its apps"; hazards=1
+  done
+  if [[ -n ${HSA_OVERRIDE_GFX_VERSION:-} ]]; then
+    warn "HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION is set globally — wrong for any GPU it doesn't match"
+    more "ravn ignores the global value and sets the right one per app"; hazards=1
+  fi
+  for v in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; do
+    [[ -n ${!v:-} ]] && { note "$v=${!v} is set in your shell"; hazards=1; }
+  done
+  local usersite
+  usersite=$(compgen -G "$HOME/.local/lib/python3*/site-packages/torch" | head -1 || true)
+  if [[ -n $usersite ]]; then
+    warn "PyTorch is installed in your user site ($(tilde "${usersite%/torch}"))"
+    more "a bare 'pip install' inside a uv venv silently lands there; ravn venvs carry their own pip"
+    hazards=1
+  fi
+  [[ $hazards == 0 ]] && ok "no global ROCm/PyTorch overrides in your shell"
+  local free_b
+  mkdir -p "$RAVN_HOME" 2>/dev/null || true
+  free_b=$(df -B1 --output=avail "$RAVN_HOME" 2>/dev/null | tail -1 | tr -d ' ' || echo 0)
+  if (( free_b < 32212254720 )); then warn "$(human "$free_b") free in $(tilde "$RAVN_HOME") — ComfyUI takes ~25 GB before models"
+  else ok "$(human "$free_b") free in $(tilde "$RAVN_HOME")"; fi
+
+  head2 "Apps"
+  local a probs
+  for a in $APPS; do
+    if is_installed "$a"; then
+      if [[ $a == comfyui ]]; then
+        probs=$(venv_problems "$(app_dir comfyui)/venv")
+        if [[ -z $probs ]]; then ok "comfyui installed · ROCm stack intact"
+        else warn "comfyui ROCm stack changed: $(tr '\n' ' ' <<<"$probs")— 'ravn heal comfyui' fixes it"; fi
+      else
+        ok "$a installed ($(grep '^version=' "$(app_dir "$a")/ravn.app" | cut -d= -f2))"
+      fi
+    else
+      note "$a not installed → ravn install $a"
+    fi
+  done
+  if ! is_installed ollama && command -v ollama >/dev/null 2>&1; then
+    note "an Ollama outside ravn is on PATH: $(command -v ollama)"
+  fi
+
+  printf '\n'
+  if (( PROBLEMS > 0 )); then
+    printf ' %sVerdict:%s %d problem(s) above need fixing first.\n\n' "$C_R" "$C_0" "$PROBLEMS"
+    return 1
+  fi
+  p=$(primary_gpu)
+  t=$(target "${GPU_GFX[p]}" "$TORCH_ARCHS")
+  if [[ $t == native ]]; then
+    printf ' %sVerdict:%s ready. Your %s runs ROCm natively.\n' "$C_T" "$C_0" "${GPU_NAME[p]}"
+  else
+    printf ' %sVerdict:%s ready, with workarounds ravn applies for you.\n' "$C_T" "$C_0"
+  fi
+  is_installed comfyui || printf '          next: %sravn install comfyui%s\n' "$C_B" "$C_0"
+  printf '\n'
+}
+
+# ── check: inspect any venv's PyTorch ───────────────────────────────────
+cmd_check() {
+  local target_path=${1:-} py
+  [[ -n $target_path ]] || die "usage: ravn check <venv dir | python binary>"
+  if [[ -d $target_path ]]; then py="$target_path/bin/python"; else py=$target_path; fi
+  [[ -x $py ]] || die "no python at $py"
+  printf '\n %sravn check%s %s\n\n' "$C_B" "$C_0" "$(tilde "$py")"
+  local probs sp
+  # ask the interpreter where torch lives: it may be a venv, the system or the user site
+  sp=$("$py" -c 'import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))' 2>/dev/null || true)
+  if [[ -n $sp ]]; then
+    note "torch from $(tilde "$sp")"
+    probs=$(sp_problems "$sp")
+  else
+    probs=$(venv_problems "$(cd "$(dirname "$py")/.." && pwd)")
+  fi
+  local line
+  while IFS= read -r line; do
+    case $line in
+      no-torch) bad "PyTorch is not installed here" ;;
+      torch-not-rocm:*) bad "${line#*:} is not a ROCm build — it will run on CPU (or crash looking for CUDA)" ;;
+      plain-triton) bad "plain 'triton' is installed over the ROCm triton — HIP kernels will fail" ;;
+      cuda-wheels) warn "NVIDIA CUDA wheels are installed (dead weight on AMD, often a sign torch was swapped)" ;;
+      onnxruntime-gpu) warn "onnxruntime-gpu is installed — CUDA-only, shadows the CPU build" ;;
+      triton-missing) bad "the ROCm triton is registered but its files are gone (removed along with plain triton)" ;;
+    esac
+  done <<<"$probs"
+  local archs; archs=$(with_env "$TORCH_ARCHS" "$py" -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null || true)
+  if [[ -n $archs ]]; then
+    detect_gpus
+    local p; p=$(primary_gpu)
+    if [[ ${#GPU_GFX[@]} -gt 0 ]]; then
+      local t; t=$(target "${GPU_GFX[p]}" "$archs")
+      case $t in
+        native) ok "this torch has kernels for your ${GPU_GFX[p]}" ;;
+        override*) ok "this torch runs your ${GPU_GFX[p]} via HSA_OVERRIDE_GFX_VERSION=$(awk '{print $2}' <<<"$t")" ;;
+        none) bad "this torch has no kernels for your ${GPU_GFX[p]} (has: $archs)" ;;
+      esac
+    fi
+  fi
+  verify_python "$py" "$TORCH_ARCHS" || true
+}
+
+# ── verify: prove the GPU actually computes ─────────────────────────────
+verify_python() { # verify_python <python> <archs>
+  local py=$1 archs=$2 out
+  out=$(with_env "$archs" "$py" - 2>&1 <<'EOF'
+import time
+try:
+    import torch
+except Exception as e:
+    print(f"FAIL import torch: {e}"); raise SystemExit(1)
+if not getattr(torch.version, "hip", None):
+    print(f"FAIL torch {torch.__version__} is not a ROCm build"); raise SystemExit(1)
+if not torch.cuda.is_available():
+    print("FAIL ROCm build, but no GPU visible to it"); raise SystemExit(1)
+dev = torch.device("cuda:0")
+a = torch.randn(4096, 4096, device=dev, dtype=torch.float16)
+b = torch.randn(4096, 4096, device=dev, dtype=torch.float16)
+ref = (a[:64].float().cpu() @ b[:, :64].float().cpu())
+got = (a @ b)[:64, :64].float().cpu()
+if not torch.allclose(ref, got, rtol=2e-2, atol=2.0):
+    print("FAIL GPU result does not match CPU"); raise SystemExit(1)
+for _ in range(3): a @ b
+torch.cuda.synchronize()
+n = 20; t = time.perf_counter()
+for _ in range(n): a @ b
+torch.cuda.synchronize()
+dt = (time.perf_counter() - t) / n
+tflops = 2 * 4096**3 / dt / 1e12
+props = torch.cuda.get_device_properties(0)
+arch = getattr(props, "gcnArchName", "?").split(":")[0]
+print(f"OK torch {torch.__version__} · HIP {torch.version.hip} · {arch} · {props.total_memory/2**30:.1f} GB · {dt*1000:.2f} ms per 4k fp16 matmul (~{tflops:.0f} TFLOPS)")
+EOF
+  ) || true
+  local last; last=$(tail -1 <<<"$out")
+  if [[ $last == OK* ]]; then ok "GPU compute verified: ${last#OK }"; return 0; fi
+  bad "GPU compute check failed: ${last#FAIL }"
+  [[ $last == FAIL* ]] || more "$(tail -4 <<<"$out" | head -3)"
+  return 1
+}
+
+cmd_verify() {
+  local a=${1:-comfyui}; valid_app "$a"; is_installed "$a" || die "$a is not installed"
+  case $a in
+    comfyui) heal_if_needed "$(app_dir comfyui)"; verify_python "$(app_dir comfyui)/venv/bin/python" "$TORCH_ARCHS" ;;
+    ollama) verify_ollama ;;
+  esac
+}
+
+# ── comfyui ─────────────────────────────────────────────────────────────
+COMFY_REPO="https://github.com/Comfy-Org/ComfyUI"
+STARTER_URL="https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors"
+
+latest_tag() { # latest_tag <git url> <glob>
+  git ls-remote --tags --refs "$1" "$2" 2>/dev/null | awk -F/ '{print $NF}' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true
+}
+
+install_comfyui() {
+  local edge=0 manager=1 starter=ask arg
+  for arg in "$@"; do
+    case $arg in
+      --edge) edge=1 ;; --no-manager) manager=0 ;;
+      --starter) starter=yes ;; --no-starter) starter=no ;;
+      *) die "unknown option $arg" ;;
+    esac
+  done
+  need git; need curl; ensure_uv; self_install
+  local app; app=$(app_dir comfyui)
+  is_installed comfyui && die "comfyui is already installed — 'ravn update comfyui' to update"
+  mkdir -p "$app"
+
+  local ref="master"
+  [[ $edge == 1 ]] || ref=$(latest_tag "$COMFY_REPO" 'v*')
+  [[ -n $ref ]] || ref=master
+  step "ComfyUI $ref → $(tilde "$app/ComfyUI")"
+  [[ -d $app/ComfyUI/.git ]] || git clone -q --depth 1 --branch "$ref" "$COMFY_REPO" "$app/ComfyUI"
+
+  step "Python $RAVN_PYTHON venv (with its own pip, so nothing falls through to the host)"
+  [[ -x $app/venv/bin/python ]] || uv venv -q --seed --python "$RAVN_PYTHON" "$app/venv"
+  install_torch "$app/venv"
+
+  local ov; ov=$(write_overrides)
+  step "ComfyUI requirements (ROCm build pinned, CUDA-only packages blocked)"
+  uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/requirements.txt" \
+    --constraint "$app/ravn-constraints.txt" --override "$ov"
+  if [[ $manager == 1 && -f $app/ComfyUI/manager_requirements.txt ]]; then
+    step "ComfyUI-Manager"
+    uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/manager_requirements.txt" \
+      --constraint "$app/ravn-constraints.txt" --override "$ov"
+  fi
+  printf 'manager=%s\n' "$manager" > "$app/ravn.conf"
+
+  [[ -z $(venv_problems "$app/venv") ]] || heal "$app"
+  verify_python "$app/venv/bin/python" "$TORCH_ARCHS" || die "PyTorch can't use the GPU — run 'ravn doctor' and open an issue with 'ravn doctor --share'"
+  mark_installed comfyui "$ref"
+  install_desktop_entry
+
+  local ck="$app/ComfyUI/models/checkpoints/v1-5-pruned-emaonly-fp16.safetensors"
+  if [[ ! -f $ck ]]; then
+    if [[ $starter == yes ]] || { [[ $starter == ask ]] && confirm "Download a 2 GB starter model (SD 1.5) so the default workflow runs?" y; }; then
+      step "Starter model"
+      curl -fL --progress-bar -o "$ck.part" "$STARTER_URL" && mv "$ck.part" "$ck"
+    fi
+  fi
+
+  printf '\n'; ok "ComfyUI is ready"
+  more "start it:   ravn run comfyui --open     (or 'ComfyUI (ravn)' in your app menu)"
+  more "models go:  $(tilde "$app/ComfyUI/models")"
+  support_line
+}
+
+run_comfyui() {
+  local app open=0 port listen; app=$(app_dir comfyui)
+  is_installed comfyui || die "comfyui is not installed — ravn install comfyui"
+  local -a extra=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --open) open=1 ;;
+      --) shift; extra+=("$@"); break ;;
+      *) extra+=("$1") ;;
+    esac
+    shift
+  done
+  port=${RAVN_COMFY_PORT:-8188}; listen=${RAVN_COMFY_LISTEN:-127.0.0.1}
+  heal_if_needed "$app"
+  local -a flags=(--listen "$listen" --port "$port")
+  grep -q '^manager=1' "$app/ravn.conf" 2>/dev/null && flags+=(--enable-manager)
+  if [[ $open == 1 ]]; then
+    ( for _ in $(seq 1 180); do
+        curl -fs -o /dev/null "http://127.0.0.1:$port/" && { xdg-open "http://127.0.0.1:$port/" >/dev/null 2>&1 || true; exit 0; }
+        sleep 1
+      done ) &
+  fi
+  cd "$app/ComfyUI"
+  # pip/uv run by ComfyUI-Manager or custom nodes inherit these pins
+  export PIP_CONSTRAINT="$app/ravn-constraints.txt" UV_CONSTRAINT="$app/ravn-constraints.txt"
+  export UV_OVERRIDE="$RAVN_HOME/.ravn/overrides.txt"
+  trap - ERR
+  with_env "$TORCH_ARCHS" "$app/venv/bin/python" main.py "${flags[@]}" "${extra[@]}"
+}
+
+update_comfyui() {
+  local app; app=$(app_dir comfyui); is_installed comfyui || die "comfyui is not installed"
+  ensure_uv
+  local cur new; cur=$(git -C "$app/ComfyUI" describe --tags 2>/dev/null || echo master)
+  if [[ $(git -C "$app/ComfyUI" rev-parse --abbrev-ref HEAD) == master ]]; then
+    step "Pulling ComfyUI master"; git -C "$app/ComfyUI" pull -q --ff-only; new=master
+  else
+    new=$(latest_tag "$COMFY_REPO" 'v*')
+    if [[ $new == "$cur" ]]; then ok "ComfyUI $cur is the latest release"
+    else
+      step "ComfyUI $cur → $new"
+      git -C "$app/ComfyUI" fetch -q --depth 1 origin tag "$new"
+      git -C "$app/ComfyUI" checkout -q "$new"
+    fi
+  fi
+  local ov; ov=$(write_overrides)
+  step "Syncing requirements"
+  uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/requirements.txt" \
+    --constraint "$app/ravn-constraints.txt" --override "$ov"
+  if grep -q '^manager=1' "$app/ravn.conf" 2>/dev/null && [[ -f $app/ComfyUI/manager_requirements.txt ]]; then
+    uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/manager_requirements.txt" \
+      --constraint "$app/ravn-constraints.txt" --override "$ov"
+  fi
+  [[ -z $(venv_problems "$app/venv") ]] || heal "$app"
+  mark_installed comfyui "$new"
+  ok "updated"
+}
+
+install_desktop_entry() {
+  local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+  mkdir -p "$apps" "$icons"
+  icon_svg > "$icons/ravn.svg"
+  cat > "$apps/ravn-comfyui.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=ComfyUI (ravn)
+Comment=Image and video generation on your AMD GPU
+Exec=$RAVN_BIN/ravn run comfyui --open
+Icon=ravn
+Terminal=true
+Categories=Graphics;
+EOF
+  command -v update-desktop-database >/dev/null && update-desktop-database -q "$apps" 2>/dev/null || true
+}
+
+icon_svg() {
+  cat <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0af5e8"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="#0a0a12"/><path d="M14 40 L30 18 L44 22 L54 18 L46 28 L50 44 L36 38 L22 48 Z" fill="none" stroke="url(#g)" stroke-width="3" stroke-linejoin="round"/><circle cx="38" cy="25" r="2.4" fill="#e8f4f8"/></svg>
+EOF
+}
+
+# ── ollama ──────────────────────────────────────────────────────────────
+OLLAMA_RELEASES="https://github.com/ollama/ollama/releases"
+
+ollama_host() { echo "${RAVN_OLLAMA_HOST:-127.0.0.1:11434}"; }
+
+ollama_archs() { # the targets compiled into the installed ROCm backend, else the default list
+  local lib list=""
+  lib=$(compgen -G "$(app_dir ollama)/lib/ollama/rocm*/libggml-hip.so*" | head -1 || true)
+  [[ -n $lib ]] && list=$(grep -aoE 'amdgcn-amd-amdhsa--gfx[0-9a-f]+' "$lib" | sed 's/.*--//' | sort -u | tr '\n' ' ' || true)
+  echo "${list:-$OLLAMA_ARCHS}"
+}
+
+ollama_vulkan_needed() {
+  detect_gpus; [[ ${#GPU_GFX[@]} -gt 0 ]] || return 1
+  [[ $(target "${GPU_GFX[$(primary_gpu)]}" "$(ollama_archs)") == none ]]
+}
+
+install_ollama() {
+  need curl; need tar; command -v zstd >/dev/null || die "zstd is required to unpack Ollama releases"
+  self_install
+  local app tag; app=$(app_dir ollama)
+  is_installed ollama && die "ollama is already installed — 'ravn update ollama' to update"
+  tag=$(curl -fsSI "$OLLAMA_RELEASES/latest" | awk -F/ 'tolower($1) ~ /^location:/ {print $NF}' | tr -d '\r')
+  [[ -n $tag ]] || die "could not find the latest Ollama release"
+  fetch_ollama "$tag"
+  mark_installed ollama "$tag"
+  verify_ollama || die "Ollama did not find your GPU — run 'ravn doctor --share' and open an issue"
+  link_ollama_cli
+  printf '\n'; ok "Ollama $tag is ready"
+  more "start it:   ravn run ollama            (or 'ravn enable ollama' to run it at login)"
+  more "then:       ravn ollama run llama3.2"
+  support_line
+}
+
+fetch_ollama() { # fetch_ollama <tag>
+  local tag=$1 app dl; app=$(app_dir ollama); dl="$app/.download"
+  mkdir -p "$dl"
+  local f
+  for f in ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst; do
+    if ollama_vulkan_needed && [[ $f == *rocm* ]]; then continue; fi
+    step "Downloading $f ($tag)"
+    curl -fL --progress-bar -C - -o "$dl/$f" "$OLLAMA_RELEASES/download/$tag/$f"
+  done
+  step "Unpacking"
+  rm -rf "${app:?}/bin" "${app:?}/lib"
+  for f in "$dl"/ollama-linux-amd64.tar.zst "$dl"/ollama-linux-amd64-rocm.tar.zst; do
+    [[ -f $f ]] && tar --zstd -xf "$f" -C "$app"
+  done
+  # NVIDIA libraries are dead weight on an AMD machine
+  rm -rf "$app"/lib/ollama/cuda_* "$app"/lib/ollama/mlx* 2>/dev/null || true
+  rm -rf "$dl"
+  [[ -x $app/bin/ollama ]] || die "unexpected Ollama archive layout (no bin/ollama)"
+}
+
+ollama_with_env() {
+  local -a extra=()
+  ollama_vulkan_needed && extra+=(OLLAMA_VULKAN=1)
+  with_env "$(ollama_archs)" env "${extra[@]}" "$@"
+}
+
+verify_ollama() {
+  local app port log pid line models; app=$(app_dir ollama)
+  port=$(( 20000 + RANDOM % 20000 )); log=$(mktemp); models=$(mktemp -d)
+  step "Starting Ollama on a scratch port to check GPU discovery"
+  OLLAMA_HOST="127.0.0.1:$port" OLLAMA_MODELS="$models" ollama_with_env "$app/bin/ollama" serve >"$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 30); do
+    grep -q 'inference compute' "$log" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  rm -rf "$models"
+  line=$(grep 'inference compute' "$log" | grep -v 'library=cpu' | head -1 || true)
+  if [[ -n $line ]]; then
+    local lib compute total
+    lib=$(grep -o 'library=[^ ]*' <<<"$line" | cut -d= -f2)
+    compute=$(grep -o 'compute=[^ ]*' <<<"$line" | cut -d= -f2)
+    total=$(grep -o 'total="[^"]*"' <<<"$line" | cut -d'"' -f2)
+    ok "Ollama sees your GPU: $lib · $compute · $total"
+    rm -f "$log"; return 0
+  fi
+  bad "Ollama started but found no GPU"
+  more "$(grep -iE 'error|warn|amdgpu|rocm' "$log" | tail -3)"
+  rm -f "$log"; return 1
+}
+
+link_ollama_cli() {
+  if command -v ollama >/dev/null 2>&1; then
+    note "another 'ollama' is on PATH ($(command -v ollama)) — use 'ravn ollama …' for this one"
+  else
+    mkdir -p "$RAVN_BIN"
+    cat > "$RAVN_BIN/ollama" <<EOF
+#!/usr/bin/env bash
+exec "$RAVN_BIN/ravn" ollama "\$@"
+EOF
+    chmod +x "$RAVN_BIN/ollama"
+  fi
+}
+
+run_ollama() {
+  local app; app=$(app_dir ollama); is_installed ollama || die "ollama is not installed — ravn install ollama"
+  if curl -fs -o /dev/null --max-time 2 "http://$(ollama_host)/api/version"; then
+    die "something already answers on $(ollama_host) — stop it, or set RAVN_OLLAMA_HOST=127.0.0.1:11435"
+  fi
+  trap - ERR
+  OLLAMA_HOST=$(ollama_host) ollama_with_env "$app/bin/ollama" serve "$@"
+}
+
+cmd_ollama() { # passthrough CLI
+  local app; app=$(app_dir ollama); is_installed ollama || die "ollama is not installed — ravn install ollama"
+  trap - ERR
+  OLLAMA_HOST=$(ollama_host) exec "$app/bin/ollama" "$@"
+}
+
+update_ollama() {
+  local app cur tag; app=$(app_dir ollama); is_installed ollama || die "ollama is not installed"
+  cur=$(grep '^version=' "$app/ravn.app" | cut -d= -f2)
+  tag=$(curl -fsSI "$OLLAMA_RELEASES/latest" | awk -F/ 'tolower($1) ~ /^location:/ {print $NF}' | tr -d '\r')
+  [[ $tag == "$cur" ]] && { ok "Ollama $cur is the latest release"; return; }
+  fetch_ollama "$tag"; mark_installed ollama "$tag"
+  ok "Ollama $cur → $tag"
+  systemctl --user is-active -q ravn-ollama 2>/dev/null && systemctl --user restart ravn-ollama && note "restarted ravn-ollama"
+  return 0
+}
+
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+cmd_enable() {
+  [[ ${1:-} == ollama ]] || die "only 'ravn enable ollama' is supported"
+  is_installed ollama || die "ollama is not installed"
+  if ! systemctl --user is-active -q ravn-ollama 2>/dev/null \
+     && curl -fs -o /dev/null --max-time 2 "http://$(ollama_host)/api/version"; then
+    die "another server already answers on $(ollama_host) — stop it, or put RAVN_OLLAMA_HOST=127.0.0.1:11435 in $(tilde "$RAVN_HOME/ravn.env")"
+  fi
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/ravn-ollama.service" <<EOF
+[Unit]
+Description=Ollama on the AMD GPU (ravn)
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+ExecStart=$RAVN_BIN/ravn run ollama
+Restart=on-failure
+RestartSec=5
+Environment=RAVN_HOME=$RAVN_HOME
+Environment=RAVN_OLLAMA_HOST=$(ollama_host)
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now ravn-ollama
+  ok "ravn-ollama runs now and at every login (logs: journalctl --user -u ravn-ollama)"
+}
+cmd_disable() {
+  [[ ${1:-} == ollama ]] || die "only 'ravn disable ollama' is supported"
+  systemctl --user disable --now ravn-ollama 2>/dev/null || true
+  rm -f "$UNIT_DIR/ravn-ollama.service"; systemctl --user daemon-reload
+  ok "ravn-ollama disabled"
+}
+
+# ── housekeeping ────────────────────────────────────────────────────────
+cmd_list() {
+  printf '\n'
+  local a
+  for a in $APPS; do
+    if is_installed "$a"; then
+      ok "$a $(grep '^version=' "$(app_dir "$a")/ravn.app" | cut -d= -f2) · $(du -sh "$(app_dir "$a")" 2>/dev/null | cut -f1) · $(tilde "$(app_dir "$a")")"
+    else
+      note "$a not installed"
+    fi
+  done
+  printf '\n'
+}
+
+cmd_remove() {
+  local a=${1:-}; valid_app "$a"; shift || true
+  [[ ${1:-} == --yes ]] && RAVN_YES=1
+  local app; app=$(app_dir "$a")
+  [[ -d $app ]] || die "$a is not installed"
+  local size; size=$(du -sh "$app" 2>/dev/null | cut -f1)
+  confirm "Delete $a ($size) at $(tilde "$app")?" n || { note "nothing removed"; return 0; }
+  if [[ $a == comfyui && -d $app/ComfyUI/models ]]; then
+    local msize keep; msize=$(du -sh "$app/ComfyUI/models" 2>/dev/null | cut -f1)
+    keep="$RAVN_HOME/comfyui-models.$(date +%Y%m%d-%H%M%S)"
+    if confirm "Keep your models ($msize) in $(tilde "$keep")?" y; then
+      mv "$app/ComfyUI/models" "$keep"; note "models kept in $(tilde "$keep")"
+    fi
+  fi
+  [[ $a == ollama ]] && cmd_disable ollama >/dev/null 2>&1 || true
+  rm -rf "${app:?}"
+  [[ $a == comfyui ]] && rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/ravn-comfyui.desktop"
+  if [[ $a == ollama && -f $RAVN_BIN/ollama ]] && grep -q 'ravn" ollama' "$RAVN_BIN/ollama"; then rm -f "$RAVN_BIN/ollama"; fi
+  ok "$a removed"
+}
+
+cmd_env() {
+  local a=${1:-comfyui} archs="$TORCH_ARCHS"
+  [[ $a == ollama ]] && archs="$(ollama_archs)"
+  gpu_env "$archs"
+  [[ $a == ollama ]] && ollama_vulkan_needed && echo "OLLAMA_VULKAN=1"
+  [[ -f $RAVN_HOME/ravn.env ]] && grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$RAVN_HOME/ravn.env" || true
+}
+
+cmd_self_update() {
+  local me tmp; me=$(readlink -f "$0"); tmp=$(mktemp)
+  curl -fsSL "https://raw.githubusercontent.com/$RAVN_REPO/main/ravn" -o "$tmp"
+  bash -n "$tmp" || die "downloaded script does not parse — not replacing"
+  local new; new=$(grep -m1 '^RAVN_VERSION=' "$tmp" | cut -d'"' -f2)
+  install -m 755 "$tmp" "$me"; rm -f "$tmp"
+  ok "ravn $RAVN_VERSION → $new"
+}
+
+usage() {
+  cat <<EOF
+
+ ${C_B}ravn${C_0} $RAVN_VERSION — local AI on AMD GPUs for Bazzite and other atomic Linux
+
+ ${C_B}ravn doctor${C_0} [--share]      why your GPU is or isn't used (--share: paste-safe report)
+ ${C_B}ravn install${C_0} <app>         comfyui [--starter --edge --no-manager] | ollama
+ ${C_B}ravn run${C_0} <app> [args]      start it with the right GPU environment (comfyui: --open)
+ ${C_B}ravn verify${C_0} <app>          prove the GPU computes (matmul / Ollama discovery)
+ ${C_B}ravn heal${C_0} comfyui          restore the ROCm PyTorch a custom node replaced
+ ${C_B}ravn check${C_0} <venv>          inspect any Python venv's PyTorch for AMD problems
+ ${C_B}ravn update${C_0} <app|self>     update an app, or ravn itself
+ ${C_B}ravn remove${C_0} <app>          uninstall (asks before touching models)
+ ${C_B}ravn list${C_0} · ${C_B}ravn env${C_0} [app]   installed apps · the environment apps get
+ ${C_B}ravn enable${C_0}|${C_B}disable${C_0} ollama   run Ollama at login (systemd --user)
+ ${C_B}ravn ollama${C_0} <args>         the Ollama CLI, pointed at ravn's server
+
+ Apps live in $(tilde "$RAVN_HOME"). Nothing outside it changes except a launcher,
+ a menu entry and (optionally) a systemd user unit. No sudo, ever.
+
+EOF
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    doctor) cmd_doctor "$@" || exit 1 ;;
+    check) cmd_check "$@" ;;
+    install)
+      local a=${1:-}; valid_app "$a"; shift
+      "install_$a" "$@" ;;
+    run)
+      local a=${1:-}; valid_app "$a"; shift
+      "run_$a" "$@" ;;
+    verify) cmd_verify "$@" || exit 1 ;;
+    heal)
+      [[ ${1:-} == comfyui ]] || die "usage: ravn heal comfyui"
+      is_installed comfyui || die "comfyui is not installed"
+      ensure_uv; heal "$(app_dir comfyui)" ;;
+    update)
+      case ${1:-} in
+        self|ravn) cmd_self_update ;;
+        comfyui|ollama) "update_$1" ;;
+        *) die "usage: ravn update <comfyui|ollama|self>" ;;
+      esac ;;
+    remove|uninstall) cmd_remove "$@" ;;
+    list|ls) cmd_list ;;
+    env) cmd_env "$@" ;;
+    enable) cmd_enable "$@" ;;
+    disable) cmd_disable "$@" ;;
+    ollama) cmd_ollama "$@" ;;
+    support) printf '%s\n' "$RAVN_SUPPORT_URL" ;;
+    version|--version|-V) echo "ravn $RAVN_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; die "unknown command '$cmd'" ;;
+  esac
+}
+
+# braces: bash parses the whole line before running it, so replacing this file mid-run is safe
+[[ ${RAVN_SOURCED:-0} == 1 ]] || { main "$@"; exit; }

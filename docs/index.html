@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ravn — local AI on AMD GPUs for Bazzite and atomic Linux</title>
+<meta name="description" content="One command to run ComfyUI and Ollama on your AMD Radeon GPU under Bazzite, Silverblue, Bluefin or SteamOS. ROCm PyTorch, no sudo, no distrobox, no CUDA wheels.">
+<meta property="og:title" content="ravn — your AMD GPU, awake">
+<meta property="og:description" content="ComfyUI and Ollama on ROCm for Bazzite and atomic Linux. One command, no sudo.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://raiyzs.github.io/ravn/">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --void:#05050c; --void-2:#0a0a12; --glass:#10101c; --line:#1f1f33; --grey:#2d2d44;
+  --teal:#0af5e8; --cyan:#00d4ff; --violet:#a855f7; --violet-d:#6b21a8;
+  --ink:#e8f4f8; --ink-2:#a9b6c4; --ink-3:#6c7889; --bad:#ff5fa2;
+  --mono:"JetBrains Mono",ui-monospace,monospace; --head:"Chakra Petch",sans-serif; --body:"IBM Plex Sans",sans-serif;
+}
+*{box-sizing:border-box}
+html{background:var(--void);color:var(--ink);font:16px/1.6 var(--body);-webkit-font-smoothing:antialiased}
+body{margin:0;overflow-x:hidden}
+a{color:var(--cyan);text-decoration:none;border-bottom:1px solid #00d4ff44}
+a:hover{border-bottom-color:var(--cyan)}
+.wrap{max-width:1040px;margin:0 auto;padding:0 20px}
+code,pre,.mono{font-family:var(--mono)}
+
+/* aurora: a thin band of light that has to earn its place */
+.aurora{position:absolute;inset:0 0 auto 0;height:520px;pointer-events:none;overflow:hidden;z-index:0}
+.aurora svg{width:100%;height:100%}
+.aurora path{animation:drift 18s ease-in-out infinite alternate}
+.aurora path:nth-child(2){animation-duration:26s;animation-delay:-8s}
+@keyframes drift{from{opacity:.35;transform:translateX(-2%)}to{opacity:.7;transform:translateX(2%)}}
+@media (prefers-reduced-motion:reduce){.aurora path{animation:none;opacity:.5}}
+
+header{position:relative;z-index:1;padding:28px 0 0}
+.nav{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.brand{display:flex;align-items:center;gap:10px;font:600 20px var(--head);letter-spacing:.06em;color:var(--ink);border:0}
+.brand svg{width:30px;height:30px}
+.nav nav{display:flex;gap:22px;font-size:14px}
+.nav nav a{color:var(--ink-2);border:0}
+.nav nav a:hover{color:var(--ink)}
+
+.hero{position:relative;z-index:1;padding-top:88px;padding-bottom:56px}
+.eyebrow{font:500 12px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--teal)}
+h1{font:600 clamp(40px,7vw,76px)/1.02 var(--head);margin:14px 0 18px;letter-spacing:-.01em}
+h1 span{background:linear-gradient(90deg,var(--teal),var(--violet));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{max-width:640px;font-size:clamp(17px,2.2vw,20px);color:var(--ink-2);margin:0 0 34px}
+
+.cmd{display:flex;align-items:stretch;max-width:840px;border:1px solid var(--line);background:var(--glass);border-radius:10px;overflow:hidden}
+.cmd code{flex:1;padding:16px 18px;font-size:14px;white-space:nowrap;overflow-x:auto;color:var(--ink)}
+.cmd code::before{content:"$ ";color:var(--ink-3)}
+.cmd button{all:unset;cursor:pointer;padding:0 18px;font:500 13px var(--mono);color:var(--void);background:var(--teal);transition:background .2s}
+.cmd button:hover{background:var(--cyan)}
+.cmd button:focus-visible{outline:2px solid var(--violet);outline-offset:-2px}
+.sub{margin-top:12px;font-size:13px;color:var(--ink-3)}
+.sub a{color:var(--ink-2)}
+
+section{position:relative;z-index:1;padding:56px 0;border-top:1px solid var(--line)}
+h2{font:600 26px/1.2 var(--head);margin:0 0 8px;letter-spacing:.01em}
+.kicker{color:var(--ink-3);margin:0 0 28px;max-width:640px}
+
+.term{background:#07070f;border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 0 0 1px #0af5e80d,0 30px 80px -40px #0af5e833}
+.term .bar{display:flex;gap:7px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.term .bar i{width:10px;height:10px;border-radius:50%;background:var(--grey)}
+.term pre{margin:0;padding:18px 20px;font-size:13px;line-height:1.65;overflow-x:auto;color:var(--ink-2)}
+.t{color:var(--teal)} .v{color:var(--violet)} .w{color:var(--ink)} .d{color:var(--ink-3)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.card{border:1px solid var(--line);background:linear-gradient(180deg,var(--glass),var(--void-2));border-radius:12px;padding:20px}
+.card h3{font:600 16px var(--head);margin:0 0 6px;letter-spacing:.02em}
+.card p{margin:0;color:var(--ink-2);font-size:15px}
+.card .k{font:500 11px var(--mono);color:var(--violet);letter-spacing:.14em;text-transform:uppercase;margin-bottom:10px;display:block}
+
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:500 12px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
+td code{font-size:13px;color:var(--ink)}
+.ok{color:var(--teal)} .mid{color:var(--violet)}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+
+.steps{counter-reset:s;display:grid;gap:12px;max-width:760px}
+.steps div{display:grid;grid-template-columns:28px 1fr;gap:14px;align-items:start}
+.steps div::before{counter-increment:s;content:counter(s);font:600 14px var(--head);color:var(--void);background:var(--teal);width:28px;height:28px;border-radius:7px;display:grid;place-items:center;margin-top:2px}
+.steps code{display:inline-block;background:var(--glass);border:1px solid var(--line);padding:2px 8px;border-radius:6px;font-size:13.5px}
+
+.support{display:flex;flex-wrap:wrap;gap:24px;align-items:center;justify-content:space-between;border:1px solid #a855f740;background:radial-gradient(120% 140% at 0% 0%,#6b21a826,transparent 60%),var(--glass);border-radius:14px;padding:28px}
+.support p{margin:6px 0 0;color:var(--ink-2);max-width:560px}
+.btn{display:inline-block;border:0;padding:12px 20px;border-radius:9px;font:600 15px var(--head);letter-spacing:.03em;color:var(--void);background:linear-gradient(90deg,var(--teal),var(--violet))}
+.btn:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--grey)}
+
+.measured{display:grid;grid-template-columns:minmax(0,380px) 1fr;gap:40px;align-items:center}
+.measured figure{margin:0}
+.measured img{width:100%;height:auto;border-radius:12px;border:1px solid var(--line);display:block}
+.measured figcaption{font-size:13px;color:var(--ink-3);margin-top:8px}
+.measured dl{margin:0;display:grid;gap:16px}
+.measured dl div{display:grid;grid-template-columns:120px 1fr;gap:16px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:14px}
+.measured dt{font:600 24px var(--head);color:var(--teal)}
+.measured dd{margin:0;color:var(--ink-2)}
+@media (max-width:760px){.measured{grid-template-columns:1fr}.measured dl div{grid-template-columns:1fr;gap:2px}}
+footer{padding:40px 0 60px;color:var(--ink-3);font-size:14px;border-top:1px solid var(--line)}
+footer .wrap{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between}
+@media (max-width:640px){.nav nav{display:none}.hero{padding-top:56px;padding-bottom:40px}.cmd code{font-size:12.5px}}
+</style>
+</head>
+<body>
+<div class="aurora" aria-hidden="true">
+  <svg viewBox="0 0 1200 520" preserveAspectRatio="none">
+    <defs>
+      <linearGradient id="a1" x1="0" x2="1"><stop offset="0" stop-color="#0af5e8" stop-opacity="0"/><stop offset=".45" stop-color="#0af5e8" stop-opacity=".22"/><stop offset="1" stop-color="#a855f7" stop-opacity="0"/></linearGradient>
+      <linearGradient id="a2" x1="0" x2="1"><stop offset="0" stop-color="#a855f7" stop-opacity="0"/><stop offset=".6" stop-color="#a855f7" stop-opacity=".16"/><stop offset="1" stop-color="#00d4ff" stop-opacity="0"/></linearGradient>
+      <filter id="blur"><feGaussianBlur stdDeviation="28"/></filter>
+    </defs>
+    <path d="M-50 210 C 220 120, 420 300, 640 190 S 1010 90, 1260 170 L1260 250 C 1000 170, 860 320, 640 270 S 200 220, -50 300 Z" fill="url(#a1)" filter="url(#blur)"/>
+    <path d="M-50 120 C 260 60, 520 210, 760 120 S 1080 40, 1260 90 L1260 140 C 1040 100, 900 230, 720 190 S 260 110, -50 190 Z" fill="url(#a2)" filter="url(#blur)"/>
+  </svg>
+</div>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="./"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0af5e8"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="#0a0a12"/><path d="M14 40 L30 18 L44 22 L54 18 L46 28 L50 44 L36 38 L22 48 Z" fill="none" stroke="url(#g)" stroke-width="3" stroke-linejoin="round"/><circle cx="38" cy="25" r="2.4" fill="#e8f4f8"/></svg>ravn</a>
+    <nav><a href="#doctor">Doctor</a><a href="#gpus">GPUs</a><a href="https://github.com/Raiyzs/ravn/blob/main/docs/GOTCHAS.md">Why it breaks</a><a href="https://github.com/Raiyzs/ravn">GitHub</a></nav>
+  </div>
+</header>
+
+<main>
+<div class="wrap hero">
+  <div class="eyebrow">ROCm · Bazzite · atomic Linux</div>
+  <h1>Your AMD GPU,<br><span>awake.</span></h1>
+  <p class="lede">ComfyUI and Ollama on your Radeon card under Bazzite, Silverblue, Bluefin or SteamOS. One command. No sudo, no distrobox, no CUDA wheels sneaking in.</p>
+  <div class="cmd"><code id="cmd">curl -fsSL https://raw.githubusercontent.com/Raiyzs/ravn/main/install.sh | bash</code><button type="button" id="copy" aria-label="Copy install command">copy</button></div>
+  <div class="sub">One bash script into <code>~/.local/bin</code>, then it runs <code>ravn doctor</code>. <a href="https://github.com/Raiyzs/ravn/blob/main/install.sh">Read it first</a>, you should.</div>
+</div>
+
+<section id="doctor">
+  <div class="wrap">
+    <h2>It tells you why the GPU sits idle</h2>
+    <p class="kicker">Most "AMD doesn't work" stories are one of five traps. <code>ravn doctor</code> checks all of them before you download anything. This is a real run on an RX 9070 XT:</p>
+    <div class="term"><div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="w">$ ravn doctor</span>
+
+ <span class="w">System</span>
+  <span class="t">✓</span> Bazzite 44 (bazzite-dx), atomic · kernel 7.2.9
+  <span class="t">✓</span> amdgpu kernel driver loaded
+  <span class="t">✓</span> /dev/kfd is accessible
+
+ <span class="w">GPUs</span>
+  <span class="t">✓</span> [0] AMD Radeon RX 9070 XT · gfx1201 · 16 GB · PyTorch ROCm: native
+  <span class="d">·</span> [1] Granite Ridge [Radeon 610M] · gfx1036 · 2.0 GB — hidden from AI apps
+  <span class="v">!</span> 2 GPUs visible to ROCm — ravn pins its apps to [0] (HIP_VISIBLE_DEVICES=0)
+      <span class="d">unpinned, PyTorch can send kernels to the iGPU: hipErrorInvalidDeviceFunction</span>
+
+ <span class="w">Environment</span>
+  <span class="v">!</span> PyTorch is installed in your user site (~/.local/lib/python3.14/site-packages)
+      <span class="d">a bare 'pip install' inside a uv venv silently lands there; ravn venvs carry their own pip</span>
+
+ <span class="t">Verdict:</span> ready. Your AMD Radeon RX 9070 XT runs ROCm natively.
+          next: <span class="w">ravn install comfyui</span></pre>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap measured">
+    <figure><img src="first-image.png" width="512" height="512" alt="The first test image ravn produced: a raven on a frozen fjord, SD 1.5"><figcaption>First image out of a fresh install. SD 1.5, seed 1001.</figcaption></figure>
+    <div>
+      <h2>Measured, not promised</h2>
+      <p class="kicker">On the RX 9070 XT ravn was built on, Bazzite 44.</p>
+      <dl>
+        <div><dt>1.5 s</dt><dd>per 512×512 SD 1.5 image, 20 steps (~26 it/s). 3.6 s for the first, model load included.</dd></div>
+        <div><dt>77 TFLOPS</dt><dd>fp16 matmul in <code>ravn verify</code>, result checked against the CPU.</dd></div>
+        <div><dt>7 s</dt><dd>from <code>ravn run comfyui</code> to the UI answering.</dd></div>
+        <div><dt>5 s</dt><dd>to heal a venv where a CPU torch and plain triton had been pip-installed over the ROCm build.</dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What it handles so you don't have to</h2>
+    <p class="kicker">Every one of these cost someone a weekend. They're written up in <a href="https://github.com/Raiyzs/ravn/blob/main/docs/GOTCHAS.md">Why it breaks</a>.</p>
+    <div class="grid">
+      <div class="card"><span class="k">no system ROCm</span><h3>Nothing to layer</h3><p>The ROCm PyTorch wheels carry their own runtime. All your distro needs is the amdgpu kernel driver, which it already has.</p></div>
+      <div class="card"><span class="k">iGPU trap</span><h3>Pins the right card</h3><p>Ryzen iGPUs show up as a second ROCm device. ravn reads the KFD topology and pins apps to the big one.</p></div>
+      <div class="card"><span class="k">overrides</span><h3>Correct per GPU</h3><p>RX 6600, 6700 XT, Steam Deck: works out the <code>HSA_OVERRIDE_GFX_VERSION</code> from the kernels inside your PyTorch, per app, never globally.</p></div>
+      <div class="card"><span class="k">self-healing</span><h3>Survives custom nodes</h3><p>A node pip-installs CUDA torch or plain triton? ravn notices before launch and puts the ROCm build back.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Three commands</h2>
+    <p class="kicker">Everything lives in <code>~/ravn</code>. Outside it ravn adds a launcher, a menu entry and, if you ask, a systemd user unit.</p>
+    <div class="steps">
+      <div><span><code>ravn install comfyui</code> Python 3.12 venv, ROCm PyTorch, ComfyUI-Manager, an optional 2 GB starter model. Then a real matmul on the GPU proves it works.</span></div>
+      <div><span><code>ravn run comfyui --open</code> starts it with the right environment and opens the browser. Also in your app menu as <em>ComfyUI (ravn)</em>.</span></div>
+      <div><span><code>ravn install ollama</code> then <code>ravn enable ollama</code>: the official ROCm build in user space, running at login, CUDA libraries stripped.</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="gpus">
+  <div class="wrap">
+    <h2>GPUs</h2>
+    <p class="kicker">From the kernels compiled into PyTorch 2.14 for ROCm 7.2. <code>ravn doctor</code> gives the answer for your card.</p>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Family</th><th>Examples</th><th>ComfyUI (PyTorch)</th><th>Ollama</th></tr></thead>
+      <tbody>
+        <tr><td>RDNA4 · gfx120x</td><td>RX 9070 XT, 9070, 9060 XT, R9700</td><td class="ok">native · tested</td><td class="ok">ROCm</td></tr>
+        <tr><td>RDNA3 · gfx110x</td><td>RX 7900 XTX, 7800 XT, 7600</td><td class="ok">native</td><td class="ok">ROCm</td></tr>
+        <tr><td>RDNA3.5 · gfx115x</td><td>Strix Halo (8060S), Strix Point (890M)</td><td class="ok">native</td><td class="ok">ROCm</td></tr>
+        <tr><td>RDNA3 iGPU · gfx1103</td><td>Radeon 780M, 760M</td><td class="ok">native</td><td class="mid">ROCm + override</td></tr>
+        <tr><td>RDNA2 · gfx1030</td><td>RX 6800, 6900 XT</td><td class="ok">native</td><td class="ok">ROCm</td></tr>
+        <tr><td>RDNA2 · gfx1031–1036</td><td>RX 6700 XT, 6600, 6500, Steam Deck</td><td class="mid">override 10.3.0</td><td class="mid">ROCm + override</td></tr>
+        <tr><td>Older (Polaris, RDNA1)</td><td>RX 580, 5700 XT</td><td>CPU / experimental</td><td class="mid">Vulkan</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap support">
+    <div>
+      <h2>Free. Pay what you want.</h2>
+      <p>ravn is MIT-licensed and stays that way. If it gave you a working GPU instead of a lost weekend, chip in what it was worth. It pays for the next app: Wan2GP video, Open WebUI and local fine-tuning are queued.</p>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a class="btn" href="https://buy.stripe.com/bJe6oG4IKgfIdvhgbBcfK03">Support ravn</a>
+      <a class="btn ghost" href="https://github.com/Raiyzs/ravn">Star on GitHub</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>ravn — made in Tromsø under the polar night, on an RX 9070 XT.</span>
+    <span><a href="https://github.com/Raiyzs/ravn">GitHub</a> · <a href="https://github.com/Raiyzs/ravn/issues">Issues</a> · MIT</span>
+  </div>
+</footer>
+<script>
+document.getElementById('copy').addEventListener('click', async e => {
+  const t = document.getElementById('cmd').textContent;
+  try { await navigator.clipboard.writeText(t); e.target.textContent = 'copied'; }
+  catch { e.target.textContent = 'select it'; }
+  setTimeout(() => e.target.textContent = 'copy', 1600);
+});
+</script>
+</body>
+</html>
