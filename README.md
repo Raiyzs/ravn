@@ -3,7 +3,8 @@
 <h1 align="center">ravn</h1>
 
 <p align="center"><b>Local AI on your AMD GPU, for Bazzite and every atomic Linux.</b><br>
-ComfyUI and Ollama on ROCm in one command. No sudo, no distrobox, no CUDA wheels.</p>
+ComfyUI and Ollama on ROCm in one command. No sudo, no distrobox, no CUDA wheels.<br>
+ComfyUI runs sandboxed: custom nodes can't read the rest of your home.</p>
 
 <p align="center">
 <a href="https://raiyzs.github.io/ravn/">Website</a> ·
@@ -62,6 +63,7 @@ points the wrong way. ravn knows them:
 | `pip` inside a uv venv | installs into your host Python | venvs carry their own pip |
 | `expandable_segments` VRAM tip | `Memory access fault by GPU node` | strips it |
 | Fedora's Python 3.14 | `torch.compile is not supported` | uses Python 3.12 |
+| a custom node is malware | nothing, until your keys are gone | runs ComfyUI in a [sandbox](#sandbox) |
 
 The long version, with fixes you can apply by hand: **[Why local AI breaks on AMD + atomic Linux](docs/GOTCHAS.md)**.
 
@@ -117,9 +119,46 @@ No sudo, no layered packages, no containers, no edits to your shell profile.
 The 6 GB PyTorch wheel stays in `~/ravn/.ravn/wheels` so healing never downloads it twice.
 `ravn remove <app>` asks before deleting models.
 
+## Sandbox
+
+ComfyUI custom nodes are Python from GitHub, and they run with your rights. Some have been
+malware: ComfyUI_LLMVISION (2024) stole browser passwords, and a hijacked `ultralytics`
+release that popular nodes depend on shipped a crypto miner. So `ravn run comfyui` starts
+ComfyUI inside [bubblewrap](https://github.com/containers/bubblewrap), the sandbox flatpak
+uses. Every atomic Fedora already has it, so there's nothing to install and no image to pull.
+
+Inside the sandbox, ComfyUI and every node it loads see:
+
+- `~/ravn/comfyui`, read-write: models, outputs, custom nodes, the venv, and its own `$HOME`
+- the GPU (`/dev/kfd`, `/dev/dri`) and the network
+- `/usr`, `/etc` and `/sys`, read-only
+
+They don't see the rest of your home (`~/.ssh`, browser profiles, password stores,
+documents, other projects), `/run/user` (session bus, Wayland, the X11 cookie), or your
+shell's environment (API keys and tokens). ravn's own files and ComfyUI's `.git` are read-only
+inside, so nothing can plant a git hook for later. Every ravn command that runs the venv's
+Python (`verify`, `heal`, `update`, `check`) runs it in the same sandbox, so code a node drops
+into the venv never runs outside it.
+
+What it doesn't stop: nodes still have the network, so they can reach the internet, your
+LAN and services on localhost, and they can use your GPU. A miner would still mine. This is
+a filesystem sandbox, not a VM.
+
+`ravn doctor` shows whether the sandbox works on your system. Everything else is settings:
+
+```bash
+RAVN_SANDBOX_BIND=~/AI/models:~/Pictures/comfy   # more folders, read-write
+RAVN_SANDBOX_RO=~/datasets                        # more folders, read-only
+RAVN_SANDBOX=0                                    # turn it off (not recommended)
+```
+
+If a node needs a token such as `HF_TOKEN`, put it in `~/ravn/ravn.env`. That file is the
+only environment that gets into the sandbox.
+
 ## Settings
 
-Put overrides in `~/ravn/ravn.env`, one `KEY=value` per line. They win over ravn's choices.
+Put overrides in `~/ravn/ravn.env`, one `KEY=value` per line, with no quotes. They win over
+ravn's choices. `RAVN_*` lines configure ravn itself, and a value set in your shell beats the file.
 
 ```bash
 RAVN_COMFY_LISTEN=0.0.0.0        # reach ComfyUI from other devices

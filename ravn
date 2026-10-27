@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # ravn — wake the AMD GPU for local AI on Bazzite and other atomic Linux.
-# User space only: no sudo, no distrobox, no CUDA wheels.
+# User space only: no sudo, no distrobox, no CUDA wheels. ComfyUI runs in a bubblewrap sandbox.
 # https://github.com/Raiyzs/ravn · MIT license
 set -Eeuo pipefail
 
-RAVN_VERSION="0.1.0"
+RAVN_VERSION="0.2.0"
 RAVN_REPO="Raiyzs/ravn"
 RAVN_HOME="${RAVN_HOME:-$HOME/ravn}"
+if [[ -f $RAVN_HOME/ravn.env ]]; then   # RAVN_* lines there configure ravn itself; the shell's own value wins
+  while IFS='=' read -r k v; do
+    [[ $k =~ ^RAVN_[A-Z_]+$ && -z ${!k+x} ]] && printf -v "$k" '%s' "$v"
+  done < "$RAVN_HOME/ravn.env"
+  unset k v
+fi
 RAVN_BIN="${RAVN_BIN:-$HOME/.local/bin}"
 RAVN_SYSFS="${RAVN_SYSFS:-/sys}"                 # tests point this at a fixture tree
 RAVN_AMDGPU_IDS="${RAVN_AMDGPU_IDS:-/usr/share/libdrm/amdgpu.ids}"
@@ -166,8 +172,10 @@ bad_alloc_conf() { # expandable_segments crashes ROCm builds of PyTorch
   return 0
 }
 
-# Run a command with the app's GPU environment applied.
-with_env() { # with_env <arch list> <cmd...>
+# Run a command with the app's GPU environment applied (--box: inside that app's sandbox).
+with_env() { # with_env [--box <app dir>] <arch list> <cmd...>
+  local -a pre=()
+  [[ $1 == --box ]] && { pre=(box "$2"); shift 2; }
   local archs=$1; shift
   local -a envs=() unsets=()
   local line v
@@ -179,7 +187,60 @@ with_env() { # with_env <arch list> <cmd...>
       [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && envs+=("$line")
     done < "$RAVN_HOME/ravn.env"
   fi
-  env "${unsets[@]}" "${envs[@]}" "$@"
+  "${pre[@]}" env "${unsets[@]}" "${envs[@]}" "$@"
+}
+
+# ── sandbox ─────────────────────────────────────────────────────────────
+# ComfyUI custom nodes are Python from GitHub running with your rights. bubblewrap (it ships
+# with flatpak) gives ComfyUI the GPU, the network and its own folder, and nothing else of
+# yours: no ~/.ssh, browser profiles or documents, and none of your shell's environment.
+sandboxed() { [[ ${RAVN_SANDBOX:-1} != 0 ]]; }
+
+box_args() { # box_args <app dir>  — bwrap arguments, NUL-separated
+  local app=$1 d py uvb v
+  local -a a=(--unshare-all --share-net --die-with-parent --clearenv
+    --ro-bind /usr /usr --ro-bind /etc /etc --ro-bind /sys /sys
+    --proc /proc --dev /dev --tmpfs /dev/shm --tmpfs /tmp
+    --dev-bind-try /dev/kfd /dev/kfd --dev-bind-try /dev/dri /dev/dri)
+  # TIOCSTI lets a process type into your terminal; where the kernel still allows it, detach
+  [[ $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null) == 0 ]] || a+=(--new-session)
+  for d in bin sbin lib lib64; do
+    if [[ -L /$d ]]; then a+=(--symlink "$(readlink "/$d")" "/$d")
+    elif [[ -d /$d ]]; then a+=(--ro-bind "/$d" "/$d"); fi
+  done
+  d=$(readlink -f /etc/resolv.conf 2>/dev/null || true)       # systemd-resolved's stub lives in /run
+  [[ $d == /run/* ]] && a+=(--ro-bind-try "$d" "$d")
+  py=$(readlink "$app/venv/bin/python" 2>/dev/null || true)   # uv: <dir>/cpython-3.12-…/bin/python3.12
+  [[ $py == /* && $py != /usr/* ]] && a+=(--ro-bind "${py%/*/bin/*}" "${py%/*/bin/*}")
+  uvb=$(command -v uv 2>/dev/null || true)
+  [[ -n $uvb && $uvb != /usr/* ]] && a+=(--ro-bind "$(readlink -f "$uvb")" "$uvb")
+  a+=(--bind "$app" "$app")
+  # read-only inside: ravn and git read these from outside the sandbox
+  for d in "$app/ravn.app" "$app/ravn.conf" "$app/ravn-constraints.txt" "$app/ComfyUI/.git" "$RAVN_HOME/.ravn"; do
+    [[ -e $d ]] && a+=(--ro-bind "$d" "$d")
+  done
+  local -a extra=()
+  IFS=: read -ra extra <<<"${RAVN_SANDBOX_BIND:-}"
+  for d in "${extra[@]}"; do [[ -n $d ]] && a+=(--bind "${d/#\~/$HOME}" "${d/#\~/$HOME}"); done
+  IFS=: read -ra extra <<<"${RAVN_SANDBOX_RO:-}"
+  for d in "${extra[@]}"; do [[ -n $d ]] && a+=(--ro-bind "${d/#\~/$HOME}" "${d/#\~/$HOME}"); done
+  a+=(--setenv HOME "$app/home" --setenv PATH "$app/venv/bin:${uvb:+${uvb%/*}:}/usr/bin:/bin")
+  for v in TERM LANG LC_ALL TZ NO_COLOR PIP_CONSTRAINT UV_CONSTRAINT UV_OVERRIDE http_proxy https_proxy no_proxy; do
+    [[ -n ${!v:-} ]] && a+=(--setenv "$v" "${!v}")
+  done
+  if [[ $PWD == "$app" || $PWD == "$app"/* ]]; then a+=(--chdir "$PWD"); else a+=(--chdir "$app"); fi
+  printf '%s\0' "${a[@]}"
+}
+
+box() { # box <app dir> <cmd...>  — run cmd inside the app's sandbox
+  local app=$1; shift
+  if ! sandboxed; then "$@"; return; fi
+  command -v bwrap >/dev/null 2>&1 \
+    || die "bubblewrap (bwrap) is needed to sandbox ComfyUI — install it (it comes with flatpak), or set RAVN_SANDBOX=0"
+  mkdir -p "$app/home"
+  local -a args=()
+  mapfile -d '' -t args < <(box_args "$app")
+  bwrap "${args[@]}" -- "$@"
 }
 
 # ── tooling ─────────────────────────────────────────────────────────────
@@ -276,7 +337,7 @@ heal() { # heal <app dir>  — undo what a stray pip install did to the ROCm sta
   done
   if [[ ${#names[@]} -gt 0 ]]; then
     step "Removing ${#names[@]} package(s) that break ROCm: ${names[*]//_/-}"
-    uv pip uninstall --python "$py" "${names[@]//_/-}" >/dev/null 2>&1 || true
+    box "$app" uv pip uninstall --python "$py" "${names[@]//_/-}" >/dev/null 2>&1 || true
   fi
   # Restore only what broke. Plain triton shares the triton/ folder, so removing it took the
   # ROCm triton's files too; a swapped torch needs the whole set back.
@@ -293,7 +354,7 @@ heal() { # heal <app dir>  — undo what a stray pip install did to the ROCm sta
         pins[i]="torch @ file://$(RAVN_TORCH=${ver%%+*} fetch_torch_wheel)"
       fi
     done
-    uv pip install -q --python "$py" --index-url "$TORCH_INDEX" --force-reinstall --no-deps "${pins[@]}"
+    box "$app" uv pip install -q --python "$py" --index-url "$TORCH_INDEX" --force-reinstall --no-deps "${pins[@]}"
   fi
   ok "healed"
 }
@@ -400,6 +461,16 @@ cmd_doctor() {
     note "uv not installed — ravn installs it into ~/.local/bin on first app install"
   fi
   command -v git >/dev/null && ok "git $(git --version | awk '{print $3}')" || bad "git not found"
+  if ! sandboxed; then
+    warn "RAVN_SANDBOX=0 — ComfyUI and its custom nodes run with full access to your files"
+  elif ! command -v bwrap >/dev/null 2>&1; then
+    warn "bubblewrap (bwrap) not found — ComfyUI won't start until it's installed (it comes with flatpak)"
+  elif bwrap --unshare-all --ro-bind / / true 2>/dev/null; then
+    ok "bubblewrap $(bwrap --version | awk '{print $2}') — ComfyUI runs sandboxed"
+  else
+    warn "bubblewrap can't create a sandbox here — unprivileged user namespaces are blocked"
+    more "ComfyUI won't start until that's allowed, or run it unsandboxed with RAVN_SANDBOX=0"
+  fi
   local v hazards=0
   for v in $(bad_alloc_conf); do
     warn "$v contains expandable_segments — crashes ROCm PyTorch; ravn strips it for its apps"; hazards=1
@@ -468,8 +539,10 @@ cmd_check() {
   [[ -x $py ]] || die "no python at $py"
   printf '\n %sravn check%s %s\n\n' "$C_B" "$C_0" "$(tilde "$py")"
   local probs sp
+  local -a bx=()   # ravn's own ComfyUI venv never runs outside its sandbox
+  [[ $(realpath -s "$py") == "$(app_dir comfyui)"/* ]] && bx=(--box "$(app_dir comfyui)")
   # ask the interpreter where torch lives: it may be a venv, the system or the user site
-  sp=$("$py" -c 'import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))' 2>/dev/null || true)
+  sp=$(with_env "${bx[@]}" "$TORCH_ARCHS" "$py" -c 'import os, torch; print(os.path.dirname(os.path.dirname(torch.__file__)))' 2>/dev/null || true)
   if [[ -n $sp ]]; then
     note "torch from $(tilde "$sp")"
     probs=$(sp_problems "$sp")
@@ -487,7 +560,7 @@ cmd_check() {
       triton-missing) bad "the ROCm triton is registered but its files are gone (removed along with plain triton)" ;;
     esac
   done <<<"$probs"
-  local archs; archs=$(with_env "$TORCH_ARCHS" "$py" -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null || true)
+  local archs; archs=$(with_env "${bx[@]}" "$TORCH_ARCHS" "$py" -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null || true)
   if [[ -n $archs ]]; then
     detect_gpus
     local p; p=$(primary_gpu)
@@ -500,13 +573,14 @@ cmd_check() {
       esac
     fi
   fi
-  verify_python "$py" "$TORCH_ARCHS" || true
+  verify_python "$py" "$TORCH_ARCHS" "${bx[1]:-}" || true
 }
 
 # ── verify: prove the GPU actually computes ─────────────────────────────
-verify_python() { # verify_python <python> <archs>
+verify_python() { # verify_python <python> <archs> [app dir: run inside its sandbox]
   local py=$1 archs=$2 out
-  out=$(with_env "$archs" "$py" - 2>&1 <<'EOF'
+  local -a bx=(); [[ -n ${3:-} ]] && bx=(--box "$3")
+  out=$(with_env "${bx[@]}" "$archs" "$py" - 2>&1 <<'EOF'
 import time
 try:
     import torch
@@ -545,7 +619,7 @@ EOF
 cmd_verify() {
   local a=${1:-comfyui}; valid_app "$a"; is_installed "$a" || die "$a is not installed"
   case $a in
-    comfyui) heal_if_needed "$(app_dir comfyui)"; verify_python "$(app_dir comfyui)/venv/bin/python" "$TORCH_ARCHS" ;;
+    comfyui) heal_if_needed "$(app_dir comfyui)"; verify_python "$(app_dir comfyui)/venv/bin/python" "$TORCH_ARCHS" "$(app_dir comfyui)" ;;
     ollama) verify_ollama ;;
   esac
 }
@@ -595,7 +669,7 @@ install_comfyui() {
   printf 'manager=%s\n' "$manager" > "$app/ravn.conf"
 
   [[ -z $(venv_problems "$app/venv") ]] || heal "$app"
-  verify_python "$app/venv/bin/python" "$TORCH_ARCHS" || die "PyTorch can't use the GPU — run 'ravn doctor' and open an issue with 'ravn doctor --share'"
+  verify_python "$app/venv/bin/python" "$TORCH_ARCHS" "$app" || die "PyTorch can't use the GPU — run 'ravn doctor' and open an issue with 'ravn doctor --share'"
   mark_installed comfyui "$ref"
   install_desktop_entry
 
@@ -639,8 +713,13 @@ run_comfyui() {
   # pip/uv run by ComfyUI-Manager or custom nodes inherit these pins
   export PIP_CONSTRAINT="$app/ravn-constraints.txt" UV_CONSTRAINT="$app/ravn-constraints.txt"
   export UV_OVERRIDE="$RAVN_HOME/.ravn/overrides.txt"
+  if sandboxed; then
+    note "sandboxed: ComfyUI and its custom nodes see $(tilde "$app"), the GPU and the network — not the rest of your home"
+  else
+    warn "RAVN_SANDBOX=0: ComfyUI and its custom nodes run with full access to your files"
+  fi
   trap - ERR
-  with_env "$TORCH_ARCHS" "$app/venv/bin/python" main.py "${flags[@]}" "${extra[@]}"
+  with_env --box "$app" "$TORCH_ARCHS" "$app/venv/bin/python" main.py "${flags[@]}" "${extra[@]}"
 }
 
 update_comfyui() {
@@ -660,10 +739,10 @@ update_comfyui() {
   fi
   local ov; ov=$(write_overrides)
   step "Syncing requirements"
-  uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/requirements.txt" \
+  box "$app" uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/requirements.txt" \
     --constraint "$app/ravn-constraints.txt" --override "$ov"
   if grep -q '^manager=1' "$app/ravn.conf" 2>/dev/null && [[ -f $app/ComfyUI/manager_requirements.txt ]]; then
-    uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/manager_requirements.txt" \
+    box "$app" uv pip install -q --python "$app/venv/bin/python" -r "$app/ComfyUI/manager_requirements.txt" \
       --constraint "$app/ravn-constraints.txt" --override "$ov"
   fi
   [[ -z $(venv_problems "$app/venv") ]] || heal "$app"

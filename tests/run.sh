@@ -141,6 +141,43 @@ O=$(PATH="$FB:$PATH" RAVN_HOME="$ROOT/h2" XDG_CONFIG_HOME="$ROOT/cfg" NO_COLOR=1
 expect "enable refuses a taken port" "$O" "another server already answers on 127.0.0.1:11434"
 [[ ! -e $ROOT/cfg/systemd/user/ravn-ollama.service ]] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL enable wrote a unit despite the conflict"; }
 
+# ── sandbox: what ComfyUI's custom nodes can reach ──
+A="$ROOT/home/comfyui"; mkdir -p "$A/ComfyUI/.git" "$A/venv/bin" "$ROOT/home/.ravn" "$ROOT/models"
+touch "$A/ravn.app" "$A/ravn.conf" "$A/ravn-constraints.txt"
+B=$(fn / "box_args '$A' | tr '\0' '\n'")
+expect "box binds the app rw" "$B" $'--bind\n'"$A"$'\n'"$A"
+expect "box hides the shell env" "$B" "--clearenv"
+expect "box home is inside the app" "$B" $'HOME\n'"$A/home"
+expect "box shares no home" "$B" "--unshare-all"
+expect "ravn.app read-only inside" "$B" $'--ro-bind\n'"$A/ravn.app"
+expect "constraints read-only inside" "$B" $'--ro-bind\n'"$A/ravn-constraints.txt"
+expect "ComfyUI .git read-only (no planted hooks)" "$B" $'--ro-bind\n'"$A/ComfyUI/.git"
+expect "ravn wheels/overrides read-only" "$B" $'--ro-bind\n'"$ROOT/home/.ravn"
+expect "GPU passed in" "$B" $'--dev-bind-try\n/dev/kfd'
+refute "real HOME not bound" "$B" $'\n'"$HOME"$'\n'
+# shellcheck disable=SC2088  # ravn.env is read literally; ravn expands the ~ itself
+B=$(RAVN_SANDBOX_BIND="$ROOT/models" RAVN_SANDBOX_RO="~/loras" fn / "box_args '$A' | tr '\0' '\n'")
+expect "extra rw bind" "$B" $'--bind\n'"$ROOT/models"
+expect "extra ro bind, ~ expanded" "$B" $'--ro-bind\n'"$HOME/loras"
+expect "sandbox off runs directly" "$(RAVN_SANDBOX=0 fn / "box '$A' echo direct")" direct
+printf 'RAVN_SANDBOX=0\nRAVN_COMFY_PORT=9999\n' > "$ROOT/home/ravn.env"
+expect "ravn.env configures ravn" "$(fn / 'echo "$RAVN_SANDBOX $RAVN_COMFY_PORT"')" "0 9999"
+expect "shell env beats ravn.env" "$(RAVN_COMFY_PORT=7777 fn / 'echo "$RAVN_COMFY_PORT"')" 7777
+rm "$ROOT/home/ravn.env"
+# live: a "custom node" in the sandbox must not read a secret elsewhere in your home
+if command -v bwrap >/dev/null && bwrap --unshare-all --ro-bind / / true 2>/dev/null; then
+  SECRET="$ROOT/secret"; echo hunter2 > "$SECRET"; echo ok > "$A/inside"
+  O=$(fn / "box '$A' cat '$SECRET' '$A/inside' 2>&1 || true; box '$A' sh -c 'touch \"$A/ravn.app\" 2>&1; echo \"home=\$HOME\"'" 2>&1)
+  refute "sandbox can't read outside files" "$O" hunter2
+  expect "sandbox reads its own app dir" "$O" ok
+  expect "ravn.app not writable inside" "$O" "Read-only file system"
+  expect "sandbox gets its own HOME" "$O" "home=$A/home"
+  O=$(GITHUB_TOKEN=leak fn / "box '$A' sh -c 'echo token=\${GITHUB_TOKEN:-none}'" 2>&1)
+  expect "shell secrets don't cross" "$O" "token=none"
+else
+  echo "skip: bubblewrap can't run here (live sandbox tests)"
+fi
+
 # ── CLI surface ──
 expect "help" "$(NO_COLOR=1 ./ravn help)" "ravn doctor"
 expect "version" "$(./ravn version)" "ravn 0."

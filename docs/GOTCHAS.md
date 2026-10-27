@@ -173,4 +173,18 @@ right file.
 
 ---
 
+## 12. Sandboxed ComfyUI can't see a folder you pointed it at
+
+**Cause:** since 0.2.0, ComfyUI runs in a bubblewrap sandbox that only sees `~/ravn/comfyui`.
+An `extra_model_paths.yaml` entry or `--output-directory` somewhere else in your home turns up
+empty, or fails with `No such file or directory`.
+
+**ravn:** add the folder to `RAVN_SANDBOX_BIND` (read-write) or `RAVN_SANDBOX_RO` (read-only) in
+`~/ravn/ravn.env`, colon-separated. Two smaller side effects of the sandbox: ComfyUI-Manager's
+"Update ComfyUI" can't write ComfyUI's `.git` (that's on purpose, use `ravn update comfyui`),
+and the MIOpen/Triton kernel caches start fresh in `~/ravn/comfyui/home`, so the first run
+after upgrading compiles them again.
+
+---
+
 Found another one? [File a GPU report](https://github.com/Raiyzs/ravn/issues/new?template=gpu-report.yml) with the output of `ravn doctor --share`.
